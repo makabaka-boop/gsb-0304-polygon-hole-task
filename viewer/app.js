@@ -27,10 +27,10 @@ const TEMPLATE = `
 <header>
   <h1>颗粒门控分析</h1>
   <div id="status" :class="{bad: !!error}"
-       :data-point-count="result ? result.points.length : ''"
-       :data-gate-count="result ? result.gates.length : ''">
+       :data-point-count="resultUsable ? result.points.length : ''"
+       :data-gate-count="resultUsable ? result.gates.length : ''">
     <span v-if="error">⚠ {{ error }}</span>
-    <span v-else-if="result">已评估 {{ result.points.length }} 点 · {{ result.gates.length }} 门 · {{ lastUpdated }}</span>
+    <span v-else-if="resultUsable">已评估 {{ result.points.length }} 点 · {{ result.gates.length }} 门 · {{ lastUpdated }}</span>
     <span v-else>评估中…</span>
     <span v-if="evaluating > 0" class="spin" title="评估中">⟳</span>
   </div>
@@ -145,15 +145,10 @@ const TEMPLATE = `
         <line v-for="t in ticks" :key="'h'+t" x1="0" :y1="t" x2="1000" :y2="t"></line>
       </g>
       <rect class="frame" x="0" y="0" width="1000" height="1000"></rect>
-      <polygon v-for="g in polygonGates" :key="'poly'+g.id" class="gate-poly"
-               :class="{emph: g.id === selectedGateId || inputGateIds.includes(g.id)}"
-               :points="polygonPointsAttr(g)"
-               :style="{stroke: gateColor(g.id), fill: gateColor(g.id)}"></polygon>
-      <template v-for="g in polygonGates" :key="'holes'+g.id">
-        <polygon v-for="(hole, h) in (g.holes || [])" :key="h" class="gate-hole"
-          :points="hole.map((v) => `${v[0]},${1000-v[1]}`).join(' ')"
-          :style="{stroke: gateColor(g.id)}"></polygon>
-      </template>
+      <path v-for="g in polygonGates" :key="'poly'+g.id" class="gate-poly"
+            :class="{emph: g.id === selectedGateId || inputGateIds.includes(g.id)}"
+            :d="polygonPathD(g)" fill-rule="evenodd"
+            :style="{stroke: gateColor(g.id), fill: gateColor(g.id)}"></path>
       <circle v-for="p in points" :key="'pt'+p.id" class="pt" :class="pointClass(p)"
               :cx="p.size" :cy="1000 - p.intensity" :r="pointRadius(p)" :data-pid="p.id">
         <title>#{{ p.id }} ({{ p.size }}, {{ p.intensity }}) 命中 {{ hitVectorText(p.id) }}</title>
@@ -188,6 +183,7 @@ const app = Vue.createApp({
       newGate: { id: "", kind: "polygon", verticesText: "", holesText: "", op: "AND", left: "", right: "" },
       reqSeq: 0,      // 已发出的最新请求序号
       appliedSeq: 0,  // 已应用到界面的请求序号
+      resultSignature: "", // 已应用响应所对应的请求体（精确到形状/排除区）
       pointRowLimit: 300,
       _debounce: null,
     };
@@ -199,13 +195,10 @@ const app = Vue.createApp({
       for (let v = 0; v <= 1000; v += 100) t.push(v);
       return t;
     },
-    // 响应必须仍对应当前的门序列，否则视为过期编辑的残留，不用于渲染
+    // 响应必须仍对应当前的门形状/点集（而不只是门 id 列表）：快速改顶点时
+    // id 不变，但旧响应已经过期，不能继续作为当前高亮与数量。
     resultUsable() {
-      return (
-        !!this.result &&
-        this.result.gates.length === this.gates.length &&
-        this.result.gates.every((g, i) => String(g.id) === String(this.gates[i].id))
-      );
+      return !!this.result && this.resultSignature === this.requestBody();
     },
     selectedIndex() {
       return this.gates.findIndex((g) => g.id === this.selectedGateId);
@@ -265,26 +258,35 @@ const app = Vue.createApp({
 
     async evaluate() {
       const seq = ++this.reqSeq;
+      const body = this.requestBody();
       this.evaluating++;
       try {
         const resp = await fetch("/api/evaluate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: this.requestBody(),
+          body,
         });
         let data = null;
         try { data = await resp.json(); } catch (_) { /* 非 JSON 响应 */ }
         if (seq !== this.reqSeq) return; // 已有更新的编辑在评估，丢弃旧响应
         if (resp.ok) {
           this.result = data;
+          this.resultSignature = body;
           this.error = null;
           this.appliedSeq = seq;
           this.lastUpdated = new Date().toLocaleTimeString();
         } else {
+          // 422：没有与当前编辑对应的有效响应，清空旧结果避免界面/API 对不上
+          this.result = null;
+          this.resultSignature = "";
+          this.appliedSeq = seq;
           this.error = (data && data.error && data.error.message) || ("HTTP " + resp.status);
         }
       } catch (e) {
         if (seq !== this.reqSeq) return;
+        this.result = null;
+        this.resultSignature = "";
+        this.appliedSeq = seq;
         this.error = "无法连接 gates 服务：" + e.message;
       } finally {
         this.evaluating--;
@@ -322,8 +324,21 @@ const app = Vue.createApp({
       return this.selectedHitIds.has(p.id) ? 11 : 6;
     },
 
-    polygonPointsAttr(g) {
-      return g.vertices.map((v) => `${v[0]},${1000 - v[1]}`).join(" ");
+    polygonPathD(g) {
+      // 外多边形与全部排除区画进同一条子路径，配合 fill-rule="evenodd"
+      // 让排除区成为真正的空洞（而不是额外的填充色块）
+      const rings = [g.vertices, ...(g.holes || [])];
+      return rings
+        .filter((ring) => Array.isArray(ring) && ring.length >= 3)
+        .map((ring) => {
+          const pts = ring
+            .filter((v) => Array.isArray(v) && v.length >= 2 &&
+              Number.isFinite(+v[0]) && Number.isFinite(+v[1]))
+            .map((v) => `${+v[0]},${1000 - +v[1]}`);
+          return pts.length >= 3 ? `M${pts.join(" L ")} Z` : "";
+        })
+        .filter(Boolean)
+        .join(" ");
     },
 
     selectGate(id) {
@@ -433,8 +448,30 @@ const app = Vue.createApp({
           verts.every((v) => Array.isArray(v) && v.length === 2 && v.every(Number.isFinite));
         if (!ok) { this.localError = "顶点须为 3~12 个 [x,y] 数对"; return; }
         let holes = [];
-        try { holes = this.newGate.holesText.trim() ? JSON.parse(this.newGate.holesText) : []; }
-        catch (_) { this.localError = "排除区须为 JSON 数组"; return; }
+        if (this.newGate.holesText.trim()) {
+          try { holes = JSON.parse(this.newGate.holesText); }
+          catch (_) { this.localError = "排除区须为 JSON 数组"; return; }
+          const validHole =
+            Array.isArray(holes) &&
+            holes.every(
+              (ring) =>
+                Array.isArray(ring) &&
+                ring.length >= 3 &&
+                ring.length <= 12 &&
+                ring.every(
+                  (v) =>
+                    Array.isArray(v) && v.length === 2 &&
+                    Number.isFinite(v[0]) && Number.isFinite(v[1])
+                ) &&
+                new Set(ring.map((v) => `${v[0]},${v[1]}`)).size === ring.length
+            );
+          if (!validHole) {
+            this.localError = "每个排除区须为 3~12 个不重复 [x,y] 数对组成的环";
+            return;
+          }
+          // 凸性、非零面积、是否严格位于外多边形内、是否互相重叠由服务端整份校验
+          holes = holes.map((ring) => ring.map((v) => [+v[0], +v[1]]));
+        }
         this.gates.push({ id, type: "polygon", vertices: verts.map((v) => [v[0], v[1]]), holes });
       } else {
         const { op, left, right } = this.newGate;

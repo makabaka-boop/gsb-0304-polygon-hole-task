@@ -5,6 +5,13 @@ ordered list of gates.  A gate is either a convex polygon (3..12 distinct
 vertices, non-zero area, boundary counts as a hit) or a combination of two
 earlier gates via AND / OR / DIFF (left set minus right set).
 
+A polygon gate may carry up to MAX_HOLES internal exclusion zones ("holes").
+Each hole is itself a 3..12-vertex convex, non-degenerate polygon, strictly
+inside the outer polygon (touching its boundary is rejected) and pairwise
+strictly disjoint from the other holes (touching or overlapping is rejected).
+A point that lies inside or on the boundary of any hole does not hit the
+gate, even when it lies on the boundary of the outer polygon.
+
 Every gate produces its own hit set; combination gates are pure set algebra
 over the hit sets of the gates they reference.  All validation failures raise
 ValidationError, which the HTTP layer maps to a single 422 for the whole
@@ -19,6 +26,7 @@ MAX_POINTS = 5000
 MAX_GATES = 20
 MIN_VERTICES = 3
 MAX_VERTICES = 12
+MAX_HOLES = 8
 COORD_MIN = 0
 COORD_MAX = 1000
 COMBO_OPS = ("AND", "OR", "DIFF")
@@ -122,6 +130,59 @@ def point_in_convex(px, py, verts, eps):
     return True
 
 
+def _orientation(verts):
+    """+1 / -1 for counter-clockwise / clockwise winding."""
+    return 1 if _signed_area2(verts) > 0 else -1
+
+
+def _strict_inside(px, py, verts, eps):
+    """Strict interior test: boundary points (within eps) are outside."""
+    orient = _orientation(verts)
+    n = len(verts)
+    for i in range(n):
+        x1, y1 = verts[i]
+        x2, y2 = verts[(i + 1) % n]
+        cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+        if orient * cross <= eps:
+            return False
+    return True
+
+
+def _project(verts, nx, ny):
+    lo = hi = verts[0][0] * nx + verts[0][1] * ny
+    for x, y in verts[1:]:
+        d = x * nx + y * ny
+        lo = min(lo, d)
+        hi = max(hi, d)
+    return lo, hi
+
+
+def _polygons_touch(a, b):
+    """SAT overlap test for two convex polygons; boundary contact counts.
+
+    Two convex polygons are disjoint iff there is an edge-normal axis with a
+    strictly positive gap between the projections.  A zero (or tolerance-
+    sized) gap on every axis means they touch or overlap.
+    """
+    tol = 1e-9 * max(1.0, _coord_scale(a), _coord_scale(b))
+    for verts in (a, b):
+        n = len(verts)
+        for i in range(n):
+            x1, y1 = verts[i]
+            x2, y2 = verts[(i + 1) % n]
+            nx = -(y2 - y1)
+            ny = (x2 - x1)
+            length = math.hypot(nx, ny)
+            nx /= length
+            ny /= length
+            amin, amax = _project(a, nx, ny)
+            bmin, bmax = _project(b, nx, ny)
+            gap = max(amin, bmin) - min(amax, bmax)
+            if gap > tol:
+                return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # validation
 
@@ -159,12 +220,13 @@ def _validate_points(raw):
     return points
 
 
-def _validate_vertices(raw, where):
+def _validate_vertices(raw, where, label="vertices"):
+    """Validate one polygon ring (outer polygon or an exclusion zone)."""
     if not isinstance(raw, list):
-        _fail(f"{where}.vertices must be a list of [x, y] pairs")
+        _fail(f"{where}.{label} must be a list of [x, y] pairs")
     if not MIN_VERTICES <= len(raw) <= MAX_VERTICES:
         _fail(
-            f"{where}.vertices must have {MIN_VERTICES}..{MAX_VERTICES} "
+            f"{where}.{label} must have {MIN_VERTICES}..{MAX_VERTICES} "
             f"vertices, got {len(raw)}"
         )
     verts = []
@@ -176,17 +238,50 @@ def _validate_vertices(raw, where):
             and _is_num(v[0])
             and _is_num(v[1])
         ):
-            _fail(f"{where}.vertices[{j}] must be a [x, y] pair of finite numbers")
+            _fail(f"{where}.{label}[{j}] must be a [x, y] pair of finite numbers")
         pt = (float(v[0]), float(v[1]))
         if pt in seen:
-            _fail(f"{where}.vertices[{j}] duplicates an earlier vertex")
+            _fail(f"{where}.{label}[{j}] duplicates an earlier vertex")
         seen.add(pt)
         verts.append(pt)
     if not _is_convex(verts):
-        _fail(f"{where}.vertices do not form a convex polygon")
+        _fail(f"{where}.{label} do not form a convex polygon")
     if abs(_signed_area2(verts)) <= _eps(verts):
-        _fail(f"{where}.vertices form a polygon with zero area")
+        _fail(f"{where}.{label} form a polygon with zero area")
     return verts
+
+
+def _validate_holes(raw, outer, where):
+    """Validate exclusion zones of one polygon gate.
+
+    Rules: a list of at most MAX_HOLES rings; each ring is a valid convex
+    non-degenerate polygon; every hole lies strictly inside the outer polygon
+    (touching its boundary is rejected); holes are pairwise strictly disjoint
+    (touching or overlapping is rejected).
+    """
+    if not isinstance(raw, list):
+        _fail(f"{where}.holes must be a list of polygons")
+    if len(raw) > MAX_HOLES:
+        _fail(f"{where} has more than {MAX_HOLES} holes: {len(raw)}")
+    holes = []
+    for h, raw_hole in enumerate(raw):
+        hole = _validate_vertices(raw_hole, where, label=f"holes[{h}].vertices")
+        outer_eps = _eps(outer)
+        for j, (x, y) in enumerate(hole):
+            if not _strict_inside(x, y, outer, outer_eps):
+                _fail(
+                    f"{where}.holes[{h}].vertices[{j}] is not strictly inside "
+                    f"the outer polygon; exclusion zones may not touch or cross "
+                    f"its boundary"
+                )
+        for k, earlier in enumerate(holes):
+            if _polygons_touch(hole, earlier):
+                _fail(
+                    f"{where}.holes[{h}] touches or overlaps holes[{k}]; "
+                    f"exclusion zones must be strictly disjoint"
+                )
+        holes.append(hole)
+    return holes
 
 
 def _validate_gate_id(raw, where):
@@ -222,7 +317,10 @@ def _validate_gates(raw):
             if "vertices" not in g:
                 _fail(f"{where} is missing 'vertices'")
             verts = _validate_vertices(g["vertices"], where)
-            gates.append({"id": gid, "type": "polygon", "vertices": verts, "holes": g.get("holes", [])})
+            holes = _validate_holes(g.get("holes", []), verts, where)
+            gates.append(
+                {"id": gid, "type": "polygon", "vertices": verts, "holes": holes}
+            )
         elif gtype == "combo":
             extra = set(g) - _COMBO_KEYS
             if extra:
@@ -284,11 +382,19 @@ def evaluate(points, gates):
         if gate["type"] == "polygon":
             verts = gate["vertices"]
             eps = _eps(verts)
-            hits = {
-                p["id"]
-                for p in points
-                if point_in_convex(p["size"], p["intensity"], verts, eps)
-            }
+            holes = gate["holes"]
+            hits = set()
+            for p in points:
+                if not point_in_convex(p["size"], p["intensity"], verts, eps):
+                    continue
+                # Points inside or on an exclusion-zone boundary are removed,
+                # even when they sit on the outer polygon's boundary.
+                if any(
+                    point_in_convex(p["size"], p["intensity"], hole, _eps(hole))
+                    for hole in holes
+                ):
+                    continue
+                hits.add(p["id"])
         else:
             left = gate_sets[index_by_id[gate["left"]]]
             right = gate_sets[index_by_id[gate["right"]]]

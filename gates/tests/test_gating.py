@@ -7,6 +7,7 @@ plain Python set algebra computed directly from the reference geometry.
 Randomized small payloads are compared field by field ("对拍").
 """
 
+import math
 import random
 import sys
 import unittest
@@ -57,11 +58,17 @@ def _ref_evaluate(points, gates):
     expected_gates = []
     for gate in gates:
         if gate["type"] == "polygon":
-            hits = {
-                p["id"]
-                for p in points
-                if _ref_in_polygon(p["size"], p["intensity"], gate["vertices"])
-            }
+            hits = set()
+            for p in points:
+                if not _ref_in_polygon(p["size"], p["intensity"], gate["vertices"]):
+                    continue
+                # exclusion zones remove interior and boundary points alike
+                if any(
+                    _ref_in_polygon(p["size"], p["intensity"], hole)
+                    for hole in gate.get("holes", [])
+                ):
+                    continue
+                hits.add(p["id"])
         else:
             left, right = sets[gate["left"]], sets[gate["right"]]
             if gate["op"] == "AND":
@@ -121,6 +128,65 @@ def _random_polygon(rng):
     raise AssertionError("could not generate a convex polygon")
 
 
+def _ref_strict_inside(px, py, verts, margin):
+    """Reference check: point is inside with a cartesian margin to the edge."""
+    if not _ref_in_polygon(px, py, verts):
+        return False
+    n = len(verts)
+    for i in range(n):
+        ax, ay = verts[i]
+        bx, by = verts[(i + 1) % n]
+        dx, dy = bx - ax, by - ay
+        length = (dx * dx + dy * dy) ** 0.5
+        if length == 0:
+            return False
+        dist = abs(dx * (py - ay) - dy * (px - ax)) / length
+        if dist < margin:
+            return False
+    return True
+
+
+def _random_holes(rng, outer):
+    """Generate 0..3 valid exclusion zones using only reference geometry.
+
+    Each hole is a small triangle; vertices are checked strictly inside the
+    outer polygon with a cartesian margin, and centers are kept farther apart
+    than the sum of their vertex radii, which guarantees pairwise disjoint
+    convex rings.
+    """
+    count = rng.randint(1, 3)
+    holes = []
+    centers = []
+    for _ in range(count):
+        for _try in range(300):
+            cx = rng.uniform(0, 1000)
+            cy = rng.uniform(0, 1000)
+            r = rng.uniform(12, 30)
+            margin = r + 2
+            if not _ref_strict_inside(cx, cy, outer, margin):
+                continue
+            theta0 = rng.uniform(0, 6.2832)
+            tri = []
+            for j in range(3):
+                theta = theta0 + j * 2.0944 + rng.uniform(-0.15, 0.15)
+                tri.append(
+                    [round(cx + r * math.cos(theta), 3),
+                     round(cy + r * math.sin(theta), 3)]
+                )
+            if not all(_ref_strict_inside(x, y, outer, 0.5) for x, y in tri):
+                continue
+            radius = max(math.hypot(x - cx, y - cy) for x, y in tri)
+            if any(
+                math.hypot(cx - ox, cy - oy) <= radius + orad + 2
+                for (ox, oy), orad in centers
+            ):
+                continue
+            holes.append(tri)
+            centers.append(((cx, cy), radius))
+            break
+    return holes
+
+
 def _random_payload(rng, n_points=25, n_gates=8):
     ids = rng.sample(range(-50, 10_000), n_points)
     points = [
@@ -132,6 +198,7 @@ def _random_payload(rng, n_points=25, n_gates=8):
         for pid in ids
     ]
     gates = []
+    probe_id = 50_000  # probe points inside exclusion zones never collide
     for i in range(n_gates):
         gid = f"G{i}"
         if i >= 2 and rng.random() < 0.5:
@@ -146,9 +213,27 @@ def _random_payload(rng, n_points=25, n_gates=8):
                 }
             )
         else:
-            gates.append(
-                {"id": gid, "type": "polygon", "vertices": _random_polygon(rng)}
-            )
+            polygon = {
+                "id": gid,
+                "type": "polygon",
+                "vertices": _random_polygon(rng),
+            }
+            # half the polygons carry exclusion zones; probe each hole with an
+            # interior point (centroid) and a boundary point (edge midpoint)
+            if rng.random() < 0.5:
+                holes = _random_holes(rng, polygon["vertices"])
+                if holes:
+                    polygon["holes"] = holes
+                    for hole in holes:
+                        cx = round(sum(v[0] for v in hole) / len(hole))
+                        cy = round(sum(v[1] for v in hole) / len(hole))
+                        mx = round((hole[0][0] + hole[1][0]) / 2)
+                        my = round((hole[0][1] + hole[1][1]) / 2)
+                        points.append({"id": probe_id, "size": cx, "intensity": cy})
+                        probe_id += 1
+                        points.append({"id": probe_id, "size": mx, "intensity": my})
+                        probe_id += 1
+            gates.append(polygon)
     return {"points": points, "gates": gates}
 
 
@@ -211,6 +296,90 @@ class CrossCheckTest(unittest.TestCase):
         points, parsed = validate_payload({"points": payload_points, "gates": gates})
         got = evaluate(points, parsed)
         self.assertEqual(got["gates"][0]["points"], [1, 2])
+
+    def test_hole_interior_and_boundary_points_are_excluded(self):
+        box = [[100, 100], [500, 100], [500, 500], [100, 500]]
+        hole = [[200, 200], [300, 200], [300, 300], [200, 300]]
+        payload = {
+            "points": [
+                {"id": 1, "size": 250, "intensity": 250},  # hole interior
+                {"id": 2, "size": 200, "intensity": 250},  # on hole left edge
+                {"id": 3, "size": 250, "intensity": 200},  # on hole bottom edge
+                {"id": 4, "size": 200, "intensity": 200},  # hole vertex
+                {"id": 5, "size": 100, "intensity": 250},  # outer edge, outside hole
+                {"id": 6, "size": 400, "intensity": 400},  # outer interior, outside hole
+            ],
+            "gates": [
+                {"id": "box", "type": "polygon", "vertices": box, "holes": [hole]}
+            ],
+        }
+        points, gates = validate_payload(payload)
+        got = evaluate(points, gates)
+        self.assertEqual(got["gates"][0]["points"], [5, 6])
+        hits = {p["id"]: p["hits"] for p in got["points"]}
+        self.assertEqual([hits[i] for i in (1, 2, 3, 4)], [[0]] * 4)
+        self.assertEqual([hits[i] for i in (5, 6)], [[1]] * 2)
+
+    def test_multiple_disjoint_holes(self):
+        box = [[0, 0], [1000, 0], [1000, 1000], [0, 1000]]
+        payload = {
+            "points": [
+                {"id": 1, "size": 250, "intensity": 250},  # hole A
+                {"id": 2, "size": 750, "intensity": 750},  # hole B
+                {"id": 3, "size": 250, "intensity": 750},  # free
+                {"id": 4, "size": 750, "intensity": 250},  # free
+            ],
+            "gates": [
+                {
+                    "id": "box",
+                    "type": "polygon",
+                    "vertices": box,
+                    "holes": [
+                        [[200, 200], [300, 200], [300, 300], [200, 300]],
+                        [[700, 700], [800, 700], [800, 800], [700, 800]],
+                    ],
+                }
+            ],
+        }
+        points, gates = validate_payload(payload)
+        got = evaluate(points, gates)
+        self.assertEqual(got["gates"][0]["points"], [3, 4])
+
+    def test_holes_propagate_through_combos(self):
+        payload = {
+            "points": [
+                {"id": 1, "size": 50, "intensity": 50},    # in A, not holed
+                {"id": 2, "size": 150, "intensity": 150},  # in A's hole, not in B
+                {"id": 3, "size": 150, "intensity": 250},  # A AND B, not holed
+                {"id": 4, "size": 200, "intensity": 200},  # vertex of both holes
+            ],
+            "gates": [
+                {
+                    "id": "A",
+                    "type": "polygon",
+                    "vertices": [[0, 0], [300, 0], [300, 300], [0, 300]],
+                    "holes": [[[100, 100], [200, 100], [200, 200], [100, 200]]],
+                },
+                {
+                    "id": "B",
+                    "type": "polygon",
+                    "vertices": [[100, 100], [400, 100], [400, 400], [100, 400]],
+                    "holes": [[[200, 200], [300, 200], [300, 300], [200, 300]]],
+                },
+                {"id": "AND", "type": "combo", "op": "AND", "left": "A", "right": "B"},
+                {"id": "AminusB", "type": "combo", "op": "DIFF", "left": "A", "right": "B"},
+            ],
+        }
+        points, gates = validate_payload(payload)
+        got = evaluate(points, gates)
+        by_id = {g["id"]: g["points"] for g in got["gates"]}
+        self.assertEqual(by_id["A"], [1, 3])
+        self.assertEqual(by_id["B"], [2, 3])
+        self.assertEqual(by_id["AND"], [3])
+        self.assertEqual(by_id["AminusB"], [1])
+        hits = {p["id"]: p["hits"] for p in got["points"]}
+        self.assertEqual(hits[2], [0, 1, 0, 0])
+        self.assertEqual(hits[4], [0, 0, 0, 0])
 
     def test_combo_chain_and_diff_direction(self):
         points = [
@@ -386,6 +555,125 @@ class HttpTest(unittest.TestCase):
                         "id": "g",
                         "type": "polygon",
                         "vertices": [[0, 0], [10, 10], [0, 10], [10, 0]],
+                    }
+                ],
+            },
+            "holes not a list": {
+                "points": [],
+                "gates": [
+                    {**poly, "holes": {"x": 1}},
+                ],
+            },
+            "hole collinear zero area": {
+                "points": [],
+                "gates": [
+                    {**poly, "holes": [[[1, 1], [2, 2], [3, 3], [4, 4]]]},
+                ],
+            },
+            "hole too few vertices": {
+                "points": [],
+                "gates": [{**poly, "holes": [[[1, 1], [2, 2]]]}],
+            },
+            "hole malformed pair": {
+                "points": [],
+                "gates": [{**poly, "holes": [[[1, 1], [2], [3, 3]]]}],
+            },
+            "hole non-finite coordinate": {
+                "points": [],
+                "gates": [
+                    {
+                        **poly,
+                        "holes": [[[1, 1], [9, 1], [5, float("nan")]]],
+                    }
+                ],
+            },
+            "hole duplicates vertex": {
+                "points": [],
+                "gates": [{**poly, "holes": [[[1, 1], [2, 2], [1, 1]]]}],
+            },
+            "hole zero area": {
+                "points": [],
+                "gates": [
+                    {**poly, "holes": [[[1, 1], [3, 3], [5, 5]]]},
+                ],
+            },
+            "hole non-convex": {
+                "points": [],
+                "gates": [
+                    {
+                        **poly,
+                        # vertices live inside x>=y triangle with room to spare
+                        "holes": [
+                            [[1, 1], [9, 1], [9, 4], [5, 3], [1, 4]],
+                        ],
+                    }
+                ],
+            },
+            "hole touches outer boundary": {
+                "points": [],
+                "gates": [
+                    {
+                        **poly,
+                        "holes": [[[0, 0], [5, 0], [0, 5]]],
+                    }
+                ],
+            },
+            "hole crosses outer boundary": {
+                "points": [],
+                "gates": [
+                    {
+                        **poly,
+                        "holes": [[[-1, -1], [5, -1], [-1, 5]]],
+                    }
+                ],
+            },
+            "hole outside outer polygon": {
+                "points": [],
+                "gates": [
+                    {
+                        **poly,
+                        "holes": [[[1, 5], [5, 5], [1, 9]]],
+                    }
+                ],
+            },
+            "holes overlap each other": {
+                "points": [],
+                "gates": [
+                    {
+                        **poly,
+                        "holes": [
+                            [[1, 1], [4, 1], [4, 4], [1, 4]],
+                            [[3, 3], [6, 3], [6, 6], [3, 6]],
+                        ],
+                    }
+                ],
+            },
+            "holes touch each other": {
+                "points": [],
+                "gates": [
+                    {
+                        **poly,
+                        "holes": [
+                            [[1, 1], [4, 1], [4, 4], [1, 4]],
+                            [[4, 1], [7, 1], [7, 4], [4, 4]],
+                        ],
+                    }
+                ],
+            },
+            "too many holes": {
+                "points": [],
+                "gates": [
+                    {
+                        "id": "big",
+                        "type": "polygon",
+                        "vertices": [[0, 0], [1000, 0], [1000, 1000], [0, 1000]],
+                        # 9 small strictly-disjoint triangles along the diagonal
+                        "holes": [
+                            [[50 + k * 100, 50 + k * 100],
+                             [70 + k * 100, 50 + k * 100],
+                             [50 + k * 100, 70 + k * 100]]
+                            for k in range(9)
+                        ],
                     }
                 ],
             },
