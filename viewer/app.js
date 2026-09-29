@@ -11,7 +11,12 @@ const SAMPLE_POINTS = [
 ];
 
 const SAMPLE_GATES = [
-  { id: "G1", type: "polygon", vertices: [[100, 100], [500, 100], [500, 500], [100, 500]] },
+  {
+    id: "G1",
+    type: "polygon",
+    vertices: [[100, 100], [500, 100], [500, 500], [100, 500]],
+    holes: [[[350, 150], [420, 150], [420, 220], [350, 220]]],
+  },
   { id: "G2", type: "polygon", vertices: [[400, 300], [900, 300], [900, 700]] },
   { id: "G3", type: "combo", op: "AND", left: "G1", right: "G2" },
   { id: "G4", type: "combo", op: "DIFF", left: "G1", right: "G2" },
@@ -145,15 +150,12 @@ const TEMPLATE = `
         <line v-for="t in ticks" :key="'h'+t" x1="0" :y1="t" x2="1000" :y2="t"></line>
       </g>
       <rect class="frame" x="0" y="0" width="1000" height="1000"></rect>
-      <polygon v-for="g in polygonGates" :key="'poly'+g.id" class="gate-poly"
-               :class="{emph: g.id === selectedGateId || inputGateIds.includes(g.id)}"
-               :points="polygonPointsAttr(g)"
-               :style="{stroke: gateColor(g.id), fill: gateColor(g.id)}"></polygon>
-      <template v-for="g in polygonGates" :key="'holes'+g.id">
-        <polygon v-for="(hole, h) in (g.holes || [])" :key="h" class="gate-hole"
-          :points="hole.map((v) => `${v[0]},${1000-v[1]}`).join(' ')"
-          :style="{stroke: gateColor(g.id)}"></polygon>
-      </template>
+      <!-- 外轮廓与所有排除区拼成一条路径，fill-rule=evenodd 使排除区成为真空洞 -->
+      <path v-for="g in polygonGates" :key="'poly'+g.id" class="gate-poly"
+            :data-gid="g.id"
+            :class="{emph: g.id === selectedGateId || inputGateIds.includes(g.id)}"
+            :d="polygonPathAttr(g)" fill-rule="evenodd"
+            :style="{stroke: gateColor(g.id), fill: gateColor(g.id)}"></path>
       <circle v-for="p in points" :key="'pt'+p.id" class="pt" :class="pointClass(p)"
               :cx="p.size" :cy="1000 - p.intensity" :r="pointRadius(p)" :data-pid="p.id">
         <title>#{{ p.id }} ({{ p.size }}, {{ p.intensity }}) 命中 {{ hitVectorText(p.id) }}</title>
@@ -188,6 +190,7 @@ const app = Vue.createApp({
       newGate: { id: "", kind: "polygon", verticesText: "", holesText: "", op: "AND", left: "", right: "" },
       reqSeq: 0,      // 已发出的最新请求序号
       appliedSeq: 0,  // 已应用到界面的请求序号
+      resultSignature: null, // 已应用响应对应的请求体（防止同 id 改形状时旧响应高亮）
       pointRowLimit: 300,
       _debounce: null,
     };
@@ -199,13 +202,10 @@ const app = Vue.createApp({
       for (let v = 0; v <= 1000; v += 100) t.push(v);
       return t;
     },
-    // 响应必须仍对应当前的门序列，否则视为过期编辑的残留，不用于渲染
+    // 响应必须仍对应当前的完整请求（点集与门定义，含顶点/排除区），否则视为
+    // 过期编辑的残留，不用于渲染。仅门 id 相同不足以保证形状相同。
     resultUsable() {
-      return (
-        !!this.result &&
-        this.result.gates.length === this.gates.length &&
-        this.result.gates.every((g, i) => String(g.id) === String(this.gates[i].id))
-      );
+      return !!this.result && this.resultSignature === this.requestBody();
     },
     selectedIndex() {
       return this.gates.findIndex((g) => g.id === this.selectedGateId);
@@ -265,26 +265,33 @@ const app = Vue.createApp({
 
     async evaluate() {
       const seq = ++this.reqSeq;
+      const body = this.requestBody(); // 本次请求的输入快照
       this.evaluating++;
       try {
         const resp = await fetch("/api/evaluate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: this.requestBody(),
+          body,
         });
         let data = null;
         try { data = await resp.json(); } catch (_) { /* 非 JSON 响应 */ }
-        if (seq !== this.reqSeq) return; // 已有更新的编辑在评估，丢弃旧响应
+        if (seq !== this.reqSeq || body !== this.requestBody()) return; // 旧响应丢弃
         if (resp.ok) {
           this.result = data;
+          this.resultSignature = body;
           this.error = null;
           this.appliedSeq = seq;
           this.lastUpdated = new Date().toLocaleTimeString();
         } else {
+          // 校验失败时旧结果同样不得继续高亮：它属于上一份输入
+          this.result = null;
+          this.resultSignature = null;
           this.error = (data && data.error && data.error.message) || ("HTTP " + resp.status);
         }
       } catch (e) {
-        if (seq !== this.reqSeq) return;
+        if (seq !== this.reqSeq || body !== this.requestBody()) return;
+        this.result = null;
+        this.resultSignature = null;
         this.error = "无法连接 gates 服务：" + e.message;
       } finally {
         this.evaluating--;
@@ -322,8 +329,15 @@ const app = Vue.createApp({
       return this.selectedHitIds.has(p.id) ? 11 : 6;
     },
 
-    polygonPointsAttr(g) {
-      return g.vertices.map((v) => `${v[0]},${1000 - v[1]}`).join(" ");
+    polygonPathAttr(g) {
+      // 外轮廓后追加每个排除区，作为同一路径的子多边形；evenodd 让内部环变空洞
+      const rings = [g.vertices, ...(g.holes || [])];
+      return rings.map((ring) => {
+        const d = ring
+          .map((v, i) => `${i === 0 ? "M" : "L"}${v[0]},${1000 - v[1]}`)
+          .join(" ");
+        return d + " Z";
+      }).join(" ");
     },
 
     selectGate(id) {
@@ -433,9 +447,26 @@ const app = Vue.createApp({
           verts.every((v) => Array.isArray(v) && v.length === 2 && v.every(Number.isFinite));
         if (!ok) { this.localError = "顶点须为 3~12 个 [x,y] 数对"; return; }
         let holes = [];
-        try { holes = this.newGate.holesText.trim() ? JSON.parse(this.newGate.holesText) : []; }
-        catch (_) { this.localError = "排除区须为 JSON 数组"; return; }
-        this.gates.push({ id, type: "polygon", vertices: verts.map((v) => [v[0], v[1]]), holes });
+        const holesText = this.newGate.holesText.trim();
+        if (holesText) {
+          try { holes = JSON.parse(holesText); }
+          catch (_) { this.localError = "排除区须为 JSON 数组"; return; }
+        }
+        const ringOk = (r) =>
+          Array.isArray(r) && r.length >= 3 && r.length <= 12 &&
+          r.every((v) => Array.isArray(v) && v.length === 2 && v.every(Number.isFinite)) &&
+          new Set(r.map((v) => `${v[0]},${v[1]}`)).size === r.length;
+        if (!Array.isArray(holes) || holes.length > 8 || !holes.every(ringOk)) {
+          this.localError =
+            "排除区须为 0~8 个环；每个环 3~12 个不重复的 [x,y] 数对，且须严格位于门内、互不接触重叠（由服务端终验）";
+          return;
+        }
+        this.gates.push({
+          id,
+          type: "polygon",
+          vertices: verts.map((v) => [v[0], v[1]]),
+          holes: holes.map((ring) => ring.map((v) => [v[0], v[1]])),
+        });
       } else {
         const { op, left, right } = this.newGate;
         if (!left || !right) { this.localError = "组合门需要选择两个输入门"; return; }

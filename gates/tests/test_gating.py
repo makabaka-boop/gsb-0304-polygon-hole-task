@@ -7,6 +7,7 @@ plain Python set algebra computed directly from the reference geometry.
 Randomized small payloads are compared field by field ("对拍").
 """
 
+import math
 import random
 import sys
 import unittest
@@ -51,6 +52,17 @@ def _ref_in_polygon(px, py, verts):
     return inside
 
 
+def _ref_hits_polygon(px, py, gate):
+    """Reference membership: inside the outer ring and no hole (boundary of
+    a hole excludes the point)."""
+    if not _ref_in_polygon(px, py, gate["vertices"]):
+        return False
+    for hole in gate.get("holes", []):
+        if _ref_in_polygon(px, py, hole):
+            return False
+    return True
+
+
 def _ref_evaluate(points, gates):
     """Independent set computation straight from the gate definitions."""
     sets = {}
@@ -60,7 +72,7 @@ def _ref_evaluate(points, gates):
             hits = {
                 p["id"]
                 for p in points
-                if _ref_in_polygon(p["size"], p["intensity"], gate["vertices"])
+                if _ref_hits_polygon(p["size"], p["intensity"], gate)
             }
         else:
             left, right = sets[gate["left"]], sets[gate["right"]]
@@ -121,6 +133,103 @@ def _random_polygon(rng):
     raise AssertionError("could not generate a convex polygon")
 
 
+def _ref_dist_to_segments(px, py, verts):
+    best = float("inf")
+    n = len(verts)
+    for i in range(n):
+        ax, ay = verts[i]
+        bx, by = verts[(i + 1) % n]
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        if length2 == 0:
+            d = math.hypot(px - ax, py - ay)
+        else:
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / length2))
+            d = math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+        best = min(best, d)
+    return best
+
+
+def _random_interior_point(rng, verts):
+    """Uniform-by-area point strictly inside a convex polygon via fan
+    triangulation from the first vertex."""
+    x0, y0 = verts[0]
+    triangles = []
+    total = 0.0
+    for i in range(1, len(verts) - 1):
+        ax, ay = verts[i]
+        bx, by = verts[i + 1]
+        area = abs((ax - x0) * (by - y0) - (ay - y0) * (bx - x0)) / 2
+        triangles.append((i, area))
+        total += area
+    pick = rng.uniform(0, total)
+    for i, area in triangles:
+        pick -= area
+        if pick <= 0:
+            ax, ay = verts[i]
+            bx, by = verts[i + 1]
+            break
+    r1, r2 = rng.random(), rng.random()
+    if r1 + r2 > 1:
+        r1, r2 = 1 - r1, 1 - r2
+    return (
+        x0 + r1 * (ax - x0) + r2 * (bx - x0),
+        y0 + r1 * (ay - y0) + r2 * (by - y0),
+    )
+
+
+def _disks_disjoint(c1, r1, c2, r2):
+    return math.hypot(c1[0] - c2[0], c1[1] - c2[1]) > r1 + r2
+
+
+def _random_polygon_gate(rng, gid):
+    verts = _random_polygon(rng)
+    gate = {"id": gid, "type": "polygon", "vertices": verts}
+    if rng.random() < 0.7:
+        k = rng.randint(1, 2)
+        holes = []
+        outer_t = [tuple(v) for v in verts]
+        placed = []
+        ok = True
+        for _ in range(k):
+            made = False
+            for _attempt in range(60):
+                cx, cy = _random_interior_point(rng, outer_t)
+                clearance = _ref_dist_to_segments(cx, cy, outer_t)
+                r = max(8.0, min(40.0, clearance * 0.35))
+                if any(not _disks_disjoint((cx, cy), r, c, rc) for c, rc in placed):
+                    continue
+                n = rng.randint(3, 5)
+                offsets = sorted(rng.uniform(0, 2 * math.pi) for _ in range(n))
+                blob = [
+                    (cx + r * rng.uniform(0.6, 1.0) * math.cos(a),
+                     cy + r * rng.uniform(0.6, 1.0) * math.sin(a))
+                    for a in offsets
+                ]
+                hull = _convex_hull(blob)
+                if len(hull) < 3:
+                    continue
+                radius = max(math.hypot(x - cx, y - cy) for x, y in hull)
+                if any(not _disks_disjoint((cx, cy), radius * 1.05, c, rc)
+                       for c, rc in placed):
+                    continue
+                if any(
+                    _ref_dist_to_segments(x, y, outer_t) < 2.0
+                    for x, y in hull
+                ):
+                    continue
+                placed.append(((cx, cy), radius * 1.05))
+                holes.append([[round(x, 3), round(y, 3)] for x, y in hull])
+                made = True
+                break
+            if not made:
+                ok = False
+                break
+        if ok and holes:
+            gate["holes"] = holes
+    return gate
+
+
 def _random_payload(rng, n_points=25, n_gates=8):
     ids = rng.sample(range(-50, 10_000), n_points)
     points = [
@@ -146,9 +255,7 @@ def _random_payload(rng, n_points=25, n_gates=8):
                 }
             )
         else:
-            gates.append(
-                {"id": gid, "type": "polygon", "vertices": _random_polygon(rng)}
-            )
+            gates.append(_random_polygon_gate(rng, gid))
     return {"points": points, "gates": gates}
 
 
@@ -159,11 +266,19 @@ def _random_payload(rng, n_points=25, n_gates=8):
 class CrossCheckTest(unittest.TestCase):
     def test_randomized_against_reference(self):
         rng = random.Random(20260926)
+        from gating import ValidationError
         for case in range(300):
-            payload = _random_payload(
-                rng, n_points=rng.randint(0, 30), n_gates=rng.randint(0, 12)
-            )
-            points, gates = validate_payload(payload)
+            for _attempt in range(100):
+                payload = _random_payload(
+                    rng, n_points=rng.randint(0, 30), n_gates=rng.randint(0, 12)
+                )
+                try:
+                    points, gates = validate_payload(payload)
+                except ValidationError:
+                    continue  # bad luck near a tolerance boundary; regenerate
+                break
+            else:  # pragma: no cover - generator is expected to converge
+                raise AssertionError(f"could not build a valid payload for case {case}")
             got = evaluate(points, gates)
             expected = _ref_evaluate(payload["points"], payload["gates"])
             self.assertEqual(
@@ -244,6 +359,71 @@ class CrossCheckTest(unittest.TestCase):
     def test_empty_inputs(self):
         got = evaluate(*validate_payload({"points": [], "gates": []}))
         self.assertEqual(got, {"gates": [], "points": []})
+
+    def test_holes_exclude_interior_and_boundary(self):
+        # box 0..600 with a square hole 200..300
+        outer = [[100, 100], [500, 100], [500, 500], [100, 500]]
+        hole = [[200, 200], [300, 200], [300, 300], [200, 300]]
+        points = [
+            {"id": 1, "size": 150, "intensity": 150},  # plain interior -> hit
+            {"id": 2, "size": 250, "intensity": 250},  # hole interior -> excluded
+            {"id": 3, "size": 200, "intensity": 250},  # hole edge -> excluded
+            {"id": 4, "size": 300, "intensity": 300},  # hole vertex -> excluded
+            {"id": 5, "size": 100, "intensity": 300},  # outer boundary -> hit
+            {"id": 6, "size": 450, "intensity": 450},  # outside hole, inside -> hit
+            {"id": 7, "size": 900, "intensity": 900},  # outside gate -> no
+        ]
+        gates = [
+            {"id": "A", "type": "polygon", "vertices": outer, "holes": [hole]},
+            {
+                "id": "B",
+                "type": "polygon",
+                "vertices": [[0, 0], [1000, 0], [1000, 1000], [0, 1000]],
+            },
+            {"id": "AandB", "type": "combo", "op": "AND", "left": "A", "right": "B"},
+        ]
+        pts, parsed = validate_payload({"points": points, "gates": gates})
+        got = evaluate(pts, parsed)
+        by_id = {g["id"]: g["points"] for g in got["gates"]}
+        self.assertEqual(by_id["A"], [1, 5, 6])
+        # combos operate on the hole-aware hit set
+        self.assertEqual(by_id["AandB"], [1, 5, 6])
+        hits = {p["id"]: p["hits"] for p in got["points"]}
+        self.assertEqual(hits[2], [0, 1, 0])
+        self.assertEqual(hits[3], [0, 1, 0])
+        self.assertEqual(hits[4], [0, 1, 0])
+        self.assertEqual(hits[5], [1, 1, 1])
+
+    def test_multiple_holes(self):
+        outer = [[0, 0], [1000, 0], [1000, 1000], [0, 1000]]
+        holes = [
+            [[100, 100], [200, 100], [200, 200], [100, 200]],
+            [[800, 800], [900, 800], [900, 900], [800, 900]],
+        ]
+        points = [
+            {"id": 1, "size": 150, "intensity": 150},  # hole 1
+            {"id": 2, "size": 850, "intensity": 850},  # hole 2
+            {"id": 3, "size": 200, "intensity": 100},  # hole 1 corner
+            {"id": 4, "size": 500, "intensity": 500},  # free
+        ]
+        payload = {
+            "points": points,
+            "gates": [{"id": "g", "type": "polygon",
+                       "vertices": outer, "holes": holes}],
+        }
+        pts, parsed = validate_payload(payload)
+        self.assertEqual(evaluate(pts, parsed)["gates"][0]["points"], [4])
+
+    def test_holes_omitted_behaves_like_before(self):
+        outer = [[0, 0], [100, 0], [100, 100], [0, 100]]
+        for gates in (
+            [{"id": "g", "type": "polygon", "vertices": outer}],
+            [{"id": "g", "type": "polygon", "vertices": outer, "holes": []}],
+        ):
+            pts, parsed = validate_payload(
+                {"points": [{"id": 1, "size": 50, "intensity": 50}], "gates": gates}
+            )
+            self.assertEqual(evaluate(pts, parsed)["gates"][0]["points"], [1])
 
 
 class HttpTest(unittest.TestCase):
@@ -412,6 +592,87 @@ class HttpTest(unittest.TestCase):
                 body = resp.get_json()
                 self.assertEqual(body["error"]["code"], "VALIDATION_FAILED")
                 self.assertTrue(body["error"]["message"])
+
+    def test_holes_422_cases(self):
+        outer = [[100, 100], [500, 100], [500, 500], [100, 500]]
+
+        def gate(holes):
+            return [{"id": "g", "type": "polygon",
+                     "vertices": outer, "holes": holes}]
+
+        h1 = [[200, 200], [300, 200], [300, 300], [200, 300]]
+        cases = {
+            "holes not a list": gate({}),
+            "hole not a ring": gate([h1, {}]),
+            "hole too few vertices": gate([[[200, 200], [300, 200]]]),
+            "hole malformed pair": gate([[[200, 200], ["x", 200], [200, 300]]]),
+            "hole non-finite": gate([[[200, 200], [float("nan"), 200], [200, 300]]]),
+            "hole duplicate vertex": gate([[[200, 200], [300, 200], [200, 200]]]),
+            "hole zero area": gate([[[200, 200], [250, 250], [300, 300]]]),
+            "hole non-convex": gate(
+                [[[200, 200], [350, 200], [350, 350], [280, 250], [200, 350]]]
+            ),
+            "hole vertex outside": gate([[[450, 450], [560, 450], [560, 560]]]),
+            "hole vertex on outer edge": gate(
+                [[[100, 200], [200, 200], [200, 300]]]
+            ),
+            "hole vertex on outer corner": gate(
+                [[[100, 100], [200, 100], [200, 200]]]
+            ),
+            "holes touch at vertex": gate(
+                [
+                    [[200, 200], [260, 200], [260, 260], [200, 260]],
+                    [[260, 200], [320, 200], [320, 260], [260, 260]],
+                ]
+            ),
+            "holes touch at edge": gate(
+                [
+                    [[200, 200], [300, 200], [300, 250], [200, 250]],
+                    [[200, 250], [300, 250], [300, 300], [200, 300]],
+                ]
+            ),
+            "holes overlap": gate(
+                [
+                    h1,
+                    [[250, 250], [400, 250], [400, 400], [250, 400]],
+                ]
+            ),
+            "hole nested in hole": gate(
+                [
+                    [[200, 200], [400, 200], [400, 400], [200, 400]],
+                    [[250, 250], [300, 250], [300, 300], [250, 300]],
+                ]
+            ),
+            "too many holes": gate(
+                [
+                    [[105 + 50 * k, 110], [130 + 50 * k, 110],
+                     [130 + 50 * k, 135], [105 + 50 * k, 135]]
+                    for k in range(9)
+                ]
+            ),
+            "extra hole field": [
+                {"id": "g", "type": "polygon", "vertices": outer,
+                 "holes": [h1], "color": "red"}
+            ],
+        }
+        for name, gates in cases.items():
+            with self.subTest(case=name):
+                resp = self._post({"points": [], "gates": gates})
+                self.assertEqual(resp.status_code, 422, resp.get_json())
+
+    def test_hole_validation_is_whole_request_422(self):
+        # An invalid hole rejects the whole request, including an earlier gate
+        outer = [[0, 0], [100, 0], [100, 100], [0, 100]]
+        payload = {
+            "points": [{"id": 1, "size": 50, "intensity": 50}],
+            "gates": [
+                {"id": "ok", "type": "polygon", "vertices": outer},
+                {"id": "bad", "type": "polygon", "vertices": outer,
+                 "holes": [[[0, 0], [10, 0], [10, 10]]]},
+            ],
+        }
+        resp = self._post(payload)
+        self.assertEqual(resp.status_code, 422)
 
     def test_non_json_body_is_422(self):
         resp = self.client.post(

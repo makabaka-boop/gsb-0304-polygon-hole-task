@@ -61,6 +61,17 @@ def test_scatter_and_gate_table_share_one_response(page, services):
         cell = page.locator(f"#points-table tr[data-pid='{pid}'] .hits")
         assert cell.inner_text() == "".join(map(str, hits))
 
+    # the exclusion hole of G1 renders as a real hole: one evenodd path with
+    # the outer ring and one inner ring (two closed subpaths); the hole
+    # vertices appear in the path data rather than as an overlaid polygon
+    g1 = page.locator("#scatter path.gate-poly[data-gid='G1']")
+    assert g1.get_attribute("fill-rule") == "evenodd"
+    d = g1.get_attribute("d")
+    assert d.count("Z") == 2  # outer ring + one hole ring
+    for vx, vy in [(350, 150), (420, 150), (420, 220), (350, 220)]:
+        assert f"{vx},{1000 - vy}" in d
+    assert page.locator("#scatter polygon.gate-hole").count() == 0
+
 
 def test_stale_response_cannot_overwrite_newer_edit(page, services):
     """Hold the initial evaluate response, edit, let the fresh response land,
@@ -122,3 +133,65 @@ def test_stale_response_cannot_overwrite_newer_edit(page, services):
         "({req: window.__gatingApp.reqSeq, applied: window.__gatingApp.appliedSeq})"
     )
     assert seqs["req"] == seqs["applied"]
+
+
+def test_stale_shape_edit_same_gate_ids_cannot_keep_old_highlight(page, services):
+    """Gate ids stay the same but a polygon's shape changes: the response to
+    the old shape must not drive the highlight even though its gate-id
+    sequence still matches the current gates."""
+    big = [[100, 100], [500, 100], [500, 500], [100, 500]]
+    small = [[100, 100], [160, 100], [160, 160], [100, 160]]
+
+    held = []
+
+    def handler(route):
+        body = route.request.post_data_json
+        verts = body["gates"][0]["vertices"]
+        if verts == small:
+            held.append(route)  # 挂起“小多边形”形状的响应
+        else:
+            route.continue_()
+
+    page.route("**/api/evaluate", handler)
+
+    page.goto(services)
+    page.wait_for_function(
+        "document.querySelector('#status').dataset.pointCount !== ''"
+    )
+
+    # 改成小多边形：其响应被挂起
+    page.evaluate(
+        "(vertsJson) => { const a = window.__gatingApp;"
+        " a.gates[0].vertices = JSON.parse(vertsJson);"
+        " a.gates[0].holes = []; a.gates = a.gates.slice(); }",
+        str(small),
+    )
+    page.wait_for_function("1 && window.__gatingApp.reqSeq >= 2")
+    assert len(held) == 1
+
+    # 改回大多边形（G1 id 未变）：新响应先落地
+    page.evaluate(
+        "(vertsJson) => { const a = window.__gatingApp;"
+        " a.gates[0].vertices = JSON.parse(vertsJson);"
+        " a.gates = a.gates.slice(); }",
+        str(big),
+    )
+    page.wait_for_function(
+        "window.__gatingApp.resultUsable &&"
+        " window.__gatingApp.result.gates[0].count > 0",
+        timeout=5000,
+    )
+    fresh_count = page.evaluate("window.__gatingApp.result.gates[0].count")
+    assert fresh_count > 0
+
+    # 放行被挂起的旧形状响应（小多边形命中 0 点）：必须被丢弃
+    held[0].continue_()
+    page.wait_for_function(
+        "window.__gatingApp.evaluating === 0", timeout=5000
+    )
+    assert (
+        page.evaluate("window.__gatingApp.result.gates[0].count")
+        == fresh_count
+    )
+    counts = _gate_counts_from_dom(page)
+    assert counts["G1"] == str(fresh_count)
